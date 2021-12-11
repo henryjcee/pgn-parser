@@ -14,6 +14,7 @@ import kotlinx.coroutines.runBlocking
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import org.slf4j.LoggerFactory
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain
+import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider
 import software.amazon.awssdk.auth.credentials.InstanceProfileCredentialsProvider
 import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider
 import software.amazon.awssdk.core.async.AsyncRequestBody
@@ -25,104 +26,101 @@ import java.util.*
 @kotlinx.coroutines.ExperimentalCoroutinesApi
 fun main() = runBlocking {
 
+    val logger = LoggerFactory.getLogger("AppKt")
+
     val yearAndMonth = System.getenv("FILE_YEAR_AND_MONTH")
+    val bucketName = System.getenv("BUCKET_NAME")
     val fileAddress = "https://database.lichess.org/standard/lichess_db_standard_rated_$yearAndMonth.pgn.bz2"
 
     val s3 = S3AsyncClient.builder().credentialsProvider(
         AwsCredentialsProviderChain.builder()
-            .addCredentialsProvider(InstanceProfileCredentialsProvider.create())
-            .addCredentialsProvider(ProfileCredentialsProvider.create("prod")).build()
+            .addCredentialsProvider(EnvironmentVariableCredentialsProvider.create())
+            .addCredentialsProvider(ProfileCredentialsProvider.create("prod"))
+            .addCredentialsProvider(InstanceProfileCredentialsProvider.create()).build()
     ).region(Region.EU_WEST_2).build()
 
     HttpClient().get<HttpStatement>(fileAddress).execute {
-        download(it.receive(), yearAndMonth, s3)
-    }
-}
 
-internal val logger = LoggerFactory.getLogger("AppKt")
+        val decompressedLines = produce {
 
-@kotlinx.coroutines.ExperimentalCoroutinesApi
-suspend fun download(input: ByteReadChannel, filePrefix: String, s3: S3AsyncClient) = runBlocking {
+            BZip2CompressorInputStream(it.receive<ByteReadChannel>().toInputStream(), true)
+                .bufferedReader()
+                .useLines {
+                    it.forEach { send(it) }
+                }
+        }
 
-    val decompressedLines = produce {
+        val gameText = produce {
 
-        BZip2CompressorInputStream(input.toInputStream(), true)
-            .bufferedReader()
-            .useLines {
-                it.forEach { send(it) }
-            }
-    }
+            val buffer = LinkedList<String>()
 
-    val gameText = produce {
+            for (line in decompressedLines) {
 
-        val buffer = LinkedList<String>()
-
-        for (line in decompressedLines) {
-
-            if (line.startsWith("[Event")) {
-                send(buffer.joinToString("\n"))
-                buffer.clear()
-            } else {
-                buffer.add(line)
+                if (line.startsWith("[Event")) {
+                    send(buffer.joinToString("\n"))
+                    buffer.clear()
+                } else {
+                    buffer.add(line)
+                }
             }
         }
-    }
 
-    val games = produce {
+        val games = produce {
 
-        for (lines in gameText) {
+            for (lines in gameText) {
 
-            val props = HashMap<String, String>()
-            lines.split("\n").forEach {
-                if (it.startsWith("[")) {
-                    props += parseProp(it)
-                } else if (it.startsWith("1.")) {
-                    if (it.contains("%eval")) { // Only want games with eval
-                        send(Game(props, it))
+                val props = HashMap<String, String>()
+                lines.split("\n").forEach {
+                    if (it.startsWith("[")) {
+                        props += parseProp(it)
+                    } else if (it.startsWith("1.")) {
+                        if (it.contains("%eval")) { // Only want games with eval
+                            send(Game(props, it))
+                        }
                     }
                 }
             }
         }
-    }
 
-    val batches = produce {
+        val batches = produce {
 
-        val buffer = LinkedList<Game>()
-        var count = 0L
+            val buffer = LinkedList<Game>()
+            var count = 0L
 
-        for (game in games) {
+            for (game in games) {
 
-            if (buffer.size > 999) {
-                send(count++ to buffer)
-                buffer.clear()
-            } else {
-                buffer.add(game)
+                if (buffer.size > 999) {
+                    send(count++ to buffer)
+                    buffer.clear()
+                } else {
+                    buffer.add(game)
+                }
             }
         }
-    }
 
-    val uploaded = produce {
+        val uploaded = produce {
 
-        val om = jacksonObjectMapper()
+            val om = jacksonObjectMapper()
 
 //        Change here if you want to do something other than put things in S3
-        for ((count, batch) in batches) {
+            for ((count, batch) in batches) {
 
-            val fileKey = "games_with_eval/${filePrefix}_${count.toString().padStart(6, '0')}"
+                val fileKey = "games_with_eval/${yearAndMonth}_${count.toString().padStart(6, '0')}"
 
-            batch.joinToString("\n") { om.writeValueAsString(it) }.let {
-                s3.putObject(
-                    PutObjectRequest.builder().acl("public-read").bucket("hcee-data-prod").key(fileKey).build(),
-                    AsyncRequestBody.fromString(it)
-                ).await()
+                batch.joinToString("\n") { om.writeValueAsString(it) }.let {
+                    s3.putObject(
+                        PutObjectRequest.builder().acl("public-read").bucket(bucketName).key(fileKey).build(),
+                        AsyncRequestBody.fromString(it)
+                    ).await()
+                }
+
+                send(fileKey)
             }
-
-            send(fileKey)
         }
-    }
 
-    uploaded.consumeEach {
-        logger.info("Uploaded file $it")
+        uploaded.consumeEach {
+            logger.info("Uploaded file $it")
+        }
     }
 }
 
