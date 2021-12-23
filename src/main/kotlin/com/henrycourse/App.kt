@@ -59,9 +59,9 @@ fun main() = runBlocking {
                 if (line.startsWith("[Event")) {
                     send(buffer.joinToString("\n"))
                     buffer.clear()
-                } else {
-                    buffer.add(line)
                 }
+
+                buffer.add(line)
             }
         }
 
@@ -75,6 +75,7 @@ fun main() = runBlocking {
                         props += parseProp(it)
                     } else if (it.startsWith("1.")) {
                         if (it.contains("%eval")) { // Only want games with eval
+                            println(it)
                             send(Game(props, it))
                         }
                     }
